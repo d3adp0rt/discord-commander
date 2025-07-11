@@ -18,7 +18,9 @@ DEFAULT_CONFIG = {
     "discord_token": "",
     "command_prefix": "!",
     "os_type": "windows",  # windows или linux
+    "model_type": "g4f",  # g4f или ollama
     "g4f_model": g4f.models.gpt_4,  # Модель G4F
+    "ollama_model": "",  # Выбранная модель Ollama
     "message_history_limit": 50,
     "dangerous_commands": [
         "rm -rf", "del /f", "format", "fdisk", "mkfs", "dd if=", 
@@ -52,20 +54,17 @@ class SecurityChecker:
         
         command_lower = command.lower()
         
-        # Проверка на опасные команды
         for dangerous_cmd in self.dangerous_commands:
             if dangerous_cmd.lower() in command_lower:
                 result["safe"] = False
                 result["dangerous_parts"].append(dangerous_cmd)
                 result["warnings"].append(f"Обнаружена опасная команда: {dangerous_cmd}")
         
-        # Проверка на подозрительные паттерны
         for pattern in self.suspicious_patterns:
             if re.search(pattern, command):
                 result["safe"] = False
                 result["warnings"].append(f"Подозрительный паттерн: {pattern}")
         
-        # Определение уровня риска
         if len(result["dangerous_parts"]) > 2:
             result["risk_level"] = "high"
         elif len(result["dangerous_parts"]) > 0:
@@ -91,10 +90,9 @@ class MessageHistory:
     
     def _compress_history(self):
         """Сжимает историю, сохраняя важные сообщения"""
-        # Оставляем последние 20 сообщений и каждое 5-е из старых
         if len(self.messages) > self.limit:
             recent = self.messages[-20:]
-            old_compressed = self.messages[:-20:5]  # Каждое 5-е сообщение
+            old_compressed = self.messages[:-20:5]
             self.messages = old_compressed + recent
     
     def get_history(self) -> List[Dict]:
@@ -152,7 +150,9 @@ class DiscordBot:
         self.history = MessageHistory(config.get("message_history_limit", 50))
         self.security_checker = SecurityChecker(config.get("dangerous_commands", []))
         self.executor = CommandExecutor(config.get("os_type", "windows"))
-        self.pending_commands = {}  # Для хранения команд, ожидающих подтверждения
+        self.pending_commands = {}
+        self.model_type = config.get("model_type", "g4f")
+        self.ollama_model = config.get("ollama_model", "")
         
         intents = discord.Intents.default()
         intents.message_content = True
@@ -176,25 +176,34 @@ class DiscordBot:
             await ctx.send("🤔 Обрабатываю запрос...")
             
             try:
-                # Добавляем сообщение в историю
                 self.history.add_message("user", question)
-                
-                # Получаем контекст истории
                 history_context = self._build_context()
                 
-                # Запрос к G4F
-                response = await g4f.ChatCompletion.create_async(
-                    model=self.config.get("g4f_model", g4f.models.gpt_4),
-                    messages=[
-                        {"role": "system", "content": f"Ты помощник для выполнения команд в {self.config['os_type']}. Когда нужно выполнить команду, напиши её в формате: COMMAND: <команда>"},
-                        {"role": "system", "content": f"История: {history_context}"},
-                        {"role": "user", "content": question}
-                    ]
-                )
+                if self.model_type == "g4f":
+                    response = await g4f.ChatCompletion.create_async(
+                        model=self.config.get("g4f_model", g4f.models.gpt_4),
+                        messages=[
+                            {"role": "system", "content": f"Ты помощник для выполнения команд в {self.config['os_type']}. Когда нужно выполнить команду, напиши её в формате: COMMAND: <команда>"},
+                            {"role": "system", "content": f"История: {history_context}"},
+                            {"role": "user", "content": question}
+                        ]
+                    )
+                elif self.model_type == "ollama":
+                    import ollama
+                    response = ollama.chat(
+                        model=self.ollama_model,
+                        messages=[
+                            {"role": "system", "content": f"Ты помощник для выполнения команд в {self.config['os_type']}. Когда нужно выполнить команду, напиши её в формате: COMMAND: <команда>"},
+                            {"role": "system", "content": f"История: {history_context}"},
+                            {"role": "user", "content": question}
+                        ]
+                    )['message']['content']
+                    print(f"Ollama response: {response}")
+                else:
+                    raise ValueError("Неизвестный тип модели")
                 
                 self.history.add_message("assistant", response)
                 
-                # Проверяем, есть ли команда в ответе
                 if "COMMAND:" in response:
                     await self._handle_command_response(ctx, response)
                 else:
@@ -226,7 +235,7 @@ class DiscordBot:
                 return
             
             history_text = "📝 **История сообщений:**\n"
-            for msg in history[-10:]:  # Показываем последние 10
+            for msg in history[-10:]:
                 role_icon = "👤" if msg["role"] == "user" else "🤖"
                 content = msg["content"][:100] + "..." if len(msg["content"]) > 100 else msg["content"]
                 history_text += f"{role_icon} {content}\n"
@@ -252,13 +261,11 @@ class DiscordBot:
             else:
                 text_parts.append(line)
         
-        # Отправляем текстовую часть ответа
         if text_parts:
             text_response = '\n'.join(text_parts).strip()
             if text_response:
                 await ctx.send(f"🤖 **Ответ AI:**\n{text_response}")
         
-        # Обрабатываем команды
         for command in commands:
             await self._execute_with_security_check(ctx, command)
     
@@ -268,7 +275,6 @@ class DiscordBot:
             await ctx.send("❌ Команда слишком длинная")
             return
         
-        # Проверка безопасности
         security_result = self.security_checker.check_command(command)
         
         if security_result["safe"] or self.config.get("auto_approve_safe", False):
@@ -315,7 +321,6 @@ class DiscordBot:
             if not output:
                 output = "✅ Команда выполнена успешно"
             
-            # Ограничиваем длину вывода
             if len(output) > 1800:
                 output = output[:1800] + "\n... (вывод обрезан)"
             
@@ -330,7 +335,7 @@ class DiscordBot:
             return ""
         
         context = ""
-        for msg in history[-5:]:  # Берем последние 5 сообщений
+        for msg in history[-5:]:
             role = "Пользователь" if msg["role"] == "user" else "AI"
             content = msg["content"][:200] + "..." if len(msg["content"]) > 200 else msg["content"]
             context += f"{role}: {content}\n"
@@ -351,13 +356,13 @@ class BotGUI:
         self.bot_instance = None
         self.bot_thread = None
         self.command_queue = queue.Queue()
+        self.available_ollama_models = self._get_available_ollama_models()
 
     def _load_config(self) -> Dict:
         """Загружает конфигурацию"""
         try:
             with open(CONFIG_PATH, 'rb') as f:
                 config = pickle.load(f)
-                # Объединяем с дефолтными значениями
                 for key, value in DEFAULT_CONFIG.items():
                     if key not in config:
                         config[key] = value
@@ -370,16 +375,25 @@ class BotGUI:
         with open(CONFIG_PATH, 'wb') as f:
             pickle.dump(self.config, f)
     
+    def _get_available_ollama_models(self) -> List[str]:
+        """Получает список доступных моделей Ollama"""
+        try:
+            import ollama
+            response = ollama.list()
+            return [model.model for model in response['models']]
+        except Exception as e:
+            print(f"Ошибка при получении моделей Ollama: {e}")
+            return []
+
+
     def main(self, page: ft.Page):
         page.title = "Discord Commander Bot"
         page.theme_mode = ft.ThemeMode.LIGHT
         page.window_width = 900
         page.window_height = 1000
         
-        # Статус бота
         self.status_text = ft.Text("🔴 Бот остановлен", color=ft.colors.RED)
         
-        # Основные настройки
         self.token_field = ft.TextField(
             label="Discord Bot Token",
             value=self.config.get("discord_token", ""),
@@ -403,7 +417,18 @@ class BotGUI:
             width=200
         )
         
-        self.provider_dropdown = ft.Dropdown(
+        self.model_type_dropdown = ft.Dropdown(
+            label="Тип модели",
+            value=self.config.get("model_type", "g4f"),
+            options=[
+                ft.dropdown.Option("g4f", "G4F"),
+                ft.dropdown.Option("ollama", "Ollama (Local)")
+            ],
+            width=200,
+            on_change=self._on_model_type_change
+        )
+        
+        self.g4f_provider_dropdown = ft.Dropdown(
             label="G4F Provider",
             value=self.config.get("g4f_model", g4f.models.gpt_4),
             options=[
@@ -412,7 +437,16 @@ class BotGUI:
                 ft.dropdown.Option(g4f.models.llama_2_70b, g4f.models.llama_2_70b.name),
                 ft.dropdown.Option(g4f.models.llama_3_1_405b, g4f.models.llama_3_1_405b.name),
             ],
-            width=200
+            width=200,
+            visible=self.config.get("model_type") == "g4f"
+        )
+        
+        self.ollama_model_dropdown = ft.Dropdown(
+            label="Модель Ollama",
+            value=self.config.get("ollama_model", ""),
+            options=[ft.dropdown.Option(model) for model in self.available_ollama_models],
+            width=200,
+            visible=self.config.get("model_type") == "ollama"
         )
         
         self.history_limit_field = ft.TextField(
@@ -426,7 +460,6 @@ class BotGUI:
             value=self.config.get("auto_approve_safe", False)
         )
         
-        # Список опасных команд
         self.dangerous_commands_field = ft.TextField(
             label="Опасные команды (через запятую)",
             value=", ".join(self.config.get("dangerous_commands", [])),
@@ -436,7 +469,6 @@ class BotGUI:
             width=500
         )
         
-        # Кнопки управления
         self.start_button = ft.ElevatedButton(
             "Запустить бота",
             icon=ft.icons.PLAY_ARROW,
@@ -458,7 +490,6 @@ class BotGUI:
             on_click=self.save_settings
         )
         
-        # Лог
         self.log_text = ft.TextField(
             label="Лог бота",
             multiline=True,
@@ -468,7 +499,9 @@ class BotGUI:
             read_only=True
         )
         
-        # Компоновка интерфейса
+        if not self.available_ollama_models and self.config.get("model_type") == "ollama":
+            self.log_text.value += f"[{datetime.now().strftime('%H:%M:%S')}] Ollama не запущен или не установлен\n"
+        
         page.add(
             ft.Container(
                 content=ft.Column([
@@ -481,8 +514,9 @@ class BotGUI:
                     
                     ft.Text("Основные настройки", size=18, weight=ft.FontWeight.BOLD),
                     ft.Row([self.token_field]),
-                    ft.Row([self.prefix_field, self.os_dropdown, self.provider_dropdown]),
-                    ft.Row([self.history_limit_field, self.auto_approve_checkbox]),
+                    ft.Row([self.prefix_field, self.os_dropdown, self.model_type_dropdown]),
+                    ft.Row([self.g4f_provider_dropdown, self.ollama_model_dropdown, self.history_limit_field]),
+                    ft.Row([self.auto_approve_checkbox]),
                     
                     ft.Divider(),
                     
@@ -503,21 +537,22 @@ class BotGUI:
             )
         )
     
+    def _on_model_type_change(self, e):
+        """Обновляет видимость выпадающих списков в зависимости от типа модели"""
+        model_type = self.model_type_dropdown.value
+        self.g4f_provider_dropdown.visible = model_type == "g4f"
+        self.ollama_model_dropdown.visible = model_type == "ollama"
+        self.g4f_provider_dropdown.page.update()
+    
     def start_bot(self, e):
         """Запускает бота"""
         try:
-            # Сохраняем настройки
             self.save_settings(None)
-            
-            # Создаем экземпляр бота
             self.bot_instance = DiscordBot(self.config)
-            
-            # Запускаем в отдельном потоке
             self.bot_thread = threading.Thread(target=self._run_bot_thread)
             self.bot_thread.daemon = True
             self.bot_thread.start()
             
-            # Обновляем интерфейс
             self.status_text.value = "🟢 Бот запущен"
             self.status_text.color = ft.colors.GREEN
             self.start_button.disabled = True
@@ -560,17 +595,20 @@ class BotGUI:
             self.config["discord_token"] = self.token_field.value
             self.config["command_prefix"] = self.prefix_field.value
             self.config["os_type"] = self.os_dropdown.value
-            self.config["g4f_model"] = self.provider_dropdown.value
+            self.config["model_type"] = self.model_type_dropdown.value
+            if self.config["model_type"] == "g4f":
+                self.config["g4f_model"] = self.g4f_provider_dropdown.value
+            elif self.config["model_type"] == "ollama":
+                self.config["ollama_model"] = self.ollama_model_dropdown.value
             self.config["message_history_limit"] = int(self.history_limit_field.value)
             self.config["auto_approve_safe"] = self.auto_approve_checkbox.value
             
-            # Обрабатываем список опасных команд
             dangerous_commands = [cmd.strip() for cmd in self.dangerous_commands_field.value.split(",")]
             self.config["dangerous_commands"] = [cmd for cmd in dangerous_commands if cmd]
             
             self._save_config()
             
-            if e:  # Если вызвано кнопкой
+            if e:
                 self.log_text.value += f"[{datetime.now().strftime('%H:%M:%S')}] Настройки сохранены\n"
                 self.save_button.page.update()
                 
